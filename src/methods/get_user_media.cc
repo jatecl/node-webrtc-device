@@ -9,6 +9,18 @@
 
 #include <webrtc/api/audio_options.h>
 #include <webrtc/api/peer_connection_interface.h>
+#include <webrtc/pc/video_track_source.h>
+#include <webrtc/api/video/video_frame.h>
+#include <webrtc/api/video/video_source_interface.h>
+#include <webrtc/media/base/video_adapter.h>
+#include <webrtc/media/base/video_broadcaster.h>
+#include <webrtc/rtc_base/synchronization/mutex.h>
+#include <webrtc/api/scoped_refptr.h>
+#include <webrtc/api/video/i420_buffer.h>
+#include <webrtc/api/video/video_frame_buffer.h>
+#include <webrtc/api/video/video_rotation.h>
+#include <webrtc/modules/video_capture/video_capture.h>
+#include <webrtc/modules/video_capture/video_capture_factory.h>
 
 #include "src/converters.h"
 #include "src/converters/arguments.h"
@@ -25,6 +37,237 @@
 #include "src/interfaces/rtc_video_source.h"
 #include "src/node/events.h"
 #include "src/node/utility.h"
+
+
+class TestVideoCapturer : public rtc::VideoSourceInterface<webrtc::VideoFrame> {
+ public:
+  class FramePreprocessor {
+   public:
+    virtual ~FramePreprocessor() = default;
+
+    virtual webrtc::VideoFrame Preprocess(const webrtc::VideoFrame& frame) = 0;
+  };
+
+  ~TestVideoCapturer() override;
+
+  void AddOrUpdateSink(rtc::VideoSinkInterface<webrtc::VideoFrame>* sink,
+                       const rtc::VideoSinkWants& wants) override;
+  void RemoveSink(rtc::VideoSinkInterface<webrtc::VideoFrame>* sink) override;
+  void SetFramePreprocessor(std::unique_ptr<FramePreprocessor> preprocessor) {
+    webrtc::MutexLock lock(&lock_);
+    preprocessor_ = std::move(preprocessor);
+  }
+
+ protected:
+  void OnFrame(const webrtc::VideoFrame& frame);
+  rtc::VideoSinkWants GetSinkWants();
+
+ private:
+  void UpdateVideoAdapter();
+  webrtc::VideoFrame MaybePreprocess(const webrtc::VideoFrame& frame);
+
+  webrtc::Mutex lock_;
+  std::unique_ptr<FramePreprocessor> preprocessor_ RTC_GUARDED_BY(lock_);
+  rtc::VideoBroadcaster broadcaster_;
+  cricket::VideoAdapter video_adapter_;
+};
+
+
+TestVideoCapturer::~TestVideoCapturer() = default;
+
+void TestVideoCapturer::OnFrame(const webrtc::VideoFrame& original_frame) {
+  int cropped_width = 0;
+  int cropped_height = 0;
+  int out_width = 0;
+  int out_height = 0;
+
+  webrtc::VideoFrame frame = MaybePreprocess(original_frame);
+
+  if (!video_adapter_.AdaptFrameResolution(
+          frame.width(), frame.height(), frame.timestamp_us() * 1000,
+          &cropped_width, &cropped_height, &out_width, &out_height)) {
+    // Drop frame in order to respect frame rate constraint.
+    return;
+  }
+
+  if (out_height != frame.height() || out_width != frame.width()) {
+    // Video adapter has requested a down-scale. Allocate a new buffer and
+    // return scaled version.
+    // For simplicity, only scale here without cropping.
+    rtc::scoped_refptr<webrtc::I420Buffer> scaled_buffer =
+        webrtc::I420Buffer::Create(out_width, out_height);
+    scaled_buffer->ScaleFrom(*frame.video_frame_buffer()->ToI420());
+    webrtc::VideoFrame::Builder new_frame_builder =
+        webrtc::VideoFrame::Builder()
+            .set_video_frame_buffer(scaled_buffer)
+            .set_rotation(webrtc::kVideoRotation_0)
+            .set_timestamp_us(frame.timestamp_us())
+            .set_id(frame.id());
+    if (frame.has_update_rect()) {
+      webrtc::VideoFrame::UpdateRect new_rect = frame.update_rect().ScaleWithFrame(
+          frame.width(), frame.height(), 0, 0, frame.width(), frame.height(),
+          out_width, out_height);
+      new_frame_builder.set_update_rect(new_rect);
+    }
+    broadcaster_.OnFrame(new_frame_builder.build());
+
+  } else {
+    // No adaptations needed, just return the frame as is.
+    broadcaster_.OnFrame(frame);
+  }
+}
+
+rtc::VideoSinkWants TestVideoCapturer::GetSinkWants() {
+  return broadcaster_.wants();
+}
+
+void TestVideoCapturer::AddOrUpdateSink(
+    rtc::VideoSinkInterface<webrtc::VideoFrame>* sink,
+    const rtc::VideoSinkWants& wants) {
+  broadcaster_.AddOrUpdateSink(sink, wants);
+  UpdateVideoAdapter();
+}
+
+void TestVideoCapturer::RemoveSink(rtc::VideoSinkInterface<webrtc::VideoFrame>* sink) {
+  broadcaster_.RemoveSink(sink);
+  UpdateVideoAdapter();
+}
+
+void TestVideoCapturer::UpdateVideoAdapter() {
+  video_adapter_.OnSinkWants(broadcaster_.wants());
+}
+
+webrtc::VideoFrame TestVideoCapturer::MaybePreprocess(const webrtc::VideoFrame& frame) {
+  webrtc::MutexLock lock(&lock_);
+  if (preprocessor_ != nullptr) {
+    return preprocessor_->Preprocess(frame);
+  } else {
+    return frame;
+  }
+}
+
+class VcmCapturer : public TestVideoCapturer,
+                    public rtc::VideoSinkInterface<webrtc::VideoFrame> {
+ public:
+  static VcmCapturer* Create(size_t width,
+                             size_t height,
+                             size_t target_fps,
+                             size_t capture_device_index);
+  virtual ~VcmCapturer();
+
+  void OnFrame(const webrtc::VideoFrame& frame) override;
+
+ private:
+  VcmCapturer();
+  bool Init(size_t width,
+            size_t height,
+            size_t target_fps,
+            size_t capture_device_index);
+  void Destroy();
+
+  rtc::scoped_refptr<webrtc::VideoCaptureModule> vcm_;
+  webrtc::VideoCaptureCapability capability_;
+};
+
+VcmCapturer::VcmCapturer() : vcm_(nullptr) {}
+
+bool VcmCapturer::Init(size_t width,
+                       size_t height,
+                       size_t target_fps,
+                       size_t capture_device_index) {
+  std::unique_ptr<webrtc::VideoCaptureModule::DeviceInfo> device_info(
+      webrtc::VideoCaptureFactory::CreateDeviceInfo());
+
+  char device_name[256];
+  char unique_name[256];
+  if (device_info->GetDeviceName(static_cast<uint32_t>(capture_device_index),
+                                 device_name, sizeof(device_name), unique_name,
+                                 sizeof(unique_name)) != 0) {
+    Destroy();
+    return false;
+  }
+
+  vcm_ = webrtc::VideoCaptureFactory::Create(unique_name);
+  if (!vcm_) {
+    return false;
+  }
+  vcm_->RegisterCaptureDataCallback(this);
+
+  device_info->GetCapability(vcm_->CurrentDeviceName(), 0, capability_);
+
+  capability_.width = static_cast<int32_t>(width);
+  capability_.height = static_cast<int32_t>(height);
+  capability_.maxFPS = static_cast<int32_t>(target_fps);
+  capability_.videoType = webrtc::VideoType::kI420;
+
+  if (vcm_->StartCapture(capability_) != 0) {
+    Destroy();
+    return false;
+  }
+
+  RTC_CHECK(vcm_->CaptureStarted());
+
+  return true;
+}
+
+VcmCapturer* VcmCapturer::Create(size_t width,
+                                 size_t height,
+                                 size_t target_fps,
+                                 size_t capture_device_index) {
+  std::unique_ptr<VcmCapturer> vcm_capturer(new VcmCapturer());
+  if (!vcm_capturer->Init(width, height, target_fps, capture_device_index)) {
+    RTC_LOG(LS_WARNING) << "Failed to create VcmCapturer(w = " << width
+                        << ", h = " << height << ", fps = " << target_fps
+                        << ")";
+    return nullptr;
+  }
+  return vcm_capturer.release();
+}
+
+void VcmCapturer::Destroy() {
+  if (!vcm_)
+    return;
+
+  vcm_->StopCapture();
+  vcm_->DeRegisterCaptureDataCallback();
+  // Release reference to VCM.
+  vcm_ = nullptr;
+}
+
+VcmCapturer::~VcmCapturer() {
+  Destroy();
+}
+
+void VcmCapturer::OnFrame(const webrtc::VideoFrame& frame) {
+  TestVideoCapturer::OnFrame(frame);
+}
+
+class CapturerTrackSource : public webrtc::VideoTrackSource {
+ public:
+  static rtc::scoped_refptr<CapturerTrackSource> Create() {
+    const size_t kWidth = 640;
+    const size_t kHeight = 480;
+    const size_t kFps = 30;
+    const size_t kDeviceIndex = 0;
+    std::unique_ptr<VcmCapturer> capturer = absl::WrapUnique(
+        VcmCapturer::Create(kWidth, kHeight, kFps, kDeviceIndex));
+    if (!capturer) {
+      return nullptr;
+    }
+    return new rtc::RefCountedObject<CapturerTrackSource>(std::move(capturer));
+  }
+
+ protected:
+  explicit CapturerTrackSource(
+      std::unique_ptr<VcmCapturer> capturer)
+      : VideoTrackSource(/*remote=*/false), capturer_(std::move(capturer)) {}
+
+ private:
+  rtc::VideoSourceInterface<webrtc::VideoFrame>* source() override {
+    return capturer_.get();
+  }
+  std::unique_ptr<VcmCapturer> capturer_;
+};
 
 // TODO(mroberts): Expand support for other members.
 struct MediaTrackConstraintSet {
@@ -122,11 +365,12 @@ Napi::Value node_webrtc::GetUserMedia::GetUserMediaImpl(const Napi::CallbackInfo
     cricket::AudioOptions options;
     auto source = factory->factory()->CreateAudioSource(options);
     auto track = factory->factory()->CreateAudioTrack(rtc::CreateRandomUuid(), source);
+    std::string id = track->id();
     stream->AddTrack(track);
   }
 
   if (video) {
-    auto source = new rtc::RefCountedObject<node_webrtc::RTCVideoTrackSource>();
+    auto source = CapturerTrackSource::Create();
     auto track = factory->factory()->CreateVideoTrack(rtc::CreateRandomUuid(), source);
     stream->AddTrack(track);
   }

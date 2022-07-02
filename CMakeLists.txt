@@ -357,6 +357,7 @@ if(WIN32)
     winmm.lib
     wmcodecdspuuid.lib
     ws2_32.lib
+    strmiids.lib
   )
 
   target_compile_definitions(${MODULE} PRIVATE

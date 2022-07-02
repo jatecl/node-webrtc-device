@@ -48,7 +48,7 @@ PeerConnectionFactory::PeerConnectionFactory(const Napi::CallbackInfo& info)
   }
 
   // TODO(mroberts): Read `audioLayer` from some PeerConnectionFactoryOptions?
-  auto audioLayer = MakeNothing<webrtc::AudioDeviceModule::AudioLayer>();
+  //auto audioLayer = MakeNothing<webrtc::AudioDeviceModule::AudioLayer>();
 
   _workerThread = rtc::Thread::CreateWithSocketServer();
   assert(_workerThread);
@@ -59,6 +59,7 @@ PeerConnectionFactory::PeerConnectionFactory(const Napi::CallbackInfo& info)
   result = _workerThread->Start();
   assert(result);
 
+  /*
   _audioDeviceModule = _workerThread->Invoke<rtc::scoped_refptr<webrtc::AudioDeviceModule>>(RTC_FROM_HERE, [audioLayer]() {
     return audioLayer.Map([](auto audioLayer) {
       // TODO(mroberts): I'm just trying to get this to compile right now.
@@ -71,6 +72,7 @@ PeerConnectionFactory::PeerConnectionFactory(const Napi::CallbackInfo& info)
               TestAudioDeviceModule::CreateDiscardRenderer(48000));
     });
   });
+  */
 
   _signalingThread = rtc::Thread::Create();
   assert(_signalingThread);
