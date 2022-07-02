@@ -28,7 +28,7 @@ The following platforms are confirmed to work with node-webrtc and have prebuilt
 <table>
   <thead>
     <tr>
-      <td colspan="2" rowspan="2"></td>
+      <td rowspan="2"></td>
       <th colspan="3">Linux</th>
       <th>macOS</th>
       <th>Windows</th>
@@ -44,11 +44,11 @@ The following platforms are confirmed to work with node-webrtc and have prebuilt
   <tbody>
     <tr>
       <th>16</th>
-        <td align="center"></td>
-        <td align="center"></td>
-        <td align="center"></td>
-        <td align="center"></td>
-        <td align="center">✓</td>
+      <td align="center"></td>
+      <td align="center"></td>
+      <td align="center"></td>
+      <td align="center"></td>
+      <td align="center">✓</td>
     </tr>
   </tbody>
 </table>
